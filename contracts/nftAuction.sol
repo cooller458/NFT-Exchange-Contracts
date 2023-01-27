@@ -915,6 +915,167 @@ contract ExchangeAuction {
         nftContractAuctions[_nftContractAddress][_tokenId].nftRecipient = address(0);
     }
 
+    /**
+     * Sözleşmenin yalnızca en yüksek teklifi tutmasını sağlamak için teklif parametrelerini güncelleyen ve teklifleri tersine çeviren dahili işlevler.
+     *
+     */
+    function _updateHighestBid(address _nftContractAddress , uint256 _tokenId , uint128 _tokenAmount) internal {
+        address auctionERC20Token = nftContractAuctions[_nftContractAddress][_tokenId].ERC20Token;
+        if (_isERC20Auction(auctionERC20Token)) {
+            IERC20(auctionERC20Token).transferFrom(msg.sender, address(this), _tokenAmount);
+            nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid = _tokenAmount;
+        } else {
+            nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid = uint128(msg.value);
+        }
+        nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBidder = msg.sender;
+    }
+    function _reverseAndResetPreviousBid( address _nftContractAddress , uint256 _tokenId) internal {
+        address nftHighestBidder = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBidder;
+        uint128 nftHighestBid = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid;
+        _resetBids(_nftContractAddress, _tokenId);
+        _payout(_nftContractAddress, _tokenId, nftHighestBidder, nftHighestBid);
+    }
+    function _reversePreviousBidAndUpdateHighestBid(address _nftContractAddress, uint256 _tokenId, uint128 _tokenAmount) internal {
+        address prevNftHighestBidder = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBidder;
+        uint256 prevNftHighestBid = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid;
+        _updateHighestBid(_nftContractAddress, _tokenId, _tokenAmount);
+        if (prevNftHighestBidder != address(0)) {
+            _payout(_nftContractAddress,_tokenId,prevNftHighestBidder,prevNftHighestBid);
+        }
+    }
+    function _transferNftAndPaySeller(address _nftContractAddress , uint256 _tokenId) internal {
+        address _nftSeller = nftContractAuctions[_nftContractAddress][_tokenId].nftSeller;
+        address _nftHighestBidder = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBidder;
+        address _nftRecipient = _getNftRecipient(_nftContractAddress, _tokenId);
+        uint128 _nftHighestBid = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid;
+        _resetBids(_nftContractAddress, _tokenId);
+        _payFeesAndSeller(_nftContractAddress,_tokenId,_nftSeller,_nftHighestBid);
+        IERC721(_nftContractAddress).transferFrom(address(this),_nftRecipient,_tokenId);
+        _resetAuction(_nftContractAddress, _tokenId);
+        emit NFTTransferredAndSellerPaid(_nftContractAddress,_tokenId,_nftSeller,_nftHighestBid,_nftHighestBidder,_nftRecipient);
+    }
+    function _payFeesAndSeller(address _nftContractAddress,uint256 _tokenId,address _nftSeller,uint256 _highestBid) internal {
+        uint256 feesPaid;
+        for (uint256 i = 0;i <nftContractAuctions[_nftContractAddress][_tokenId].feeRecipients.length;i++) {
+            uint256 fee = _getPortionOfBid(_highestBid,nftContractAuctions[_nftContractAddress][_tokenId].feePercentages[i]);
+            feesPaid = feesPaid + fee;
+            _payout(_nftContractAddress,_tokenId,nftContractAuctions[_nftContractAddress][_tokenId].feeRecipients[i],fee);
+        }
+        _payout(_nftContractAddress,_tokenId,_nftSeller,(_highestBid - feesPaid));
+    }
+     function _payout(address _nftContractAddress,uint256 _tokenId,address _recipient,uint256 _amount) internal {
+        address auctionERC20Token = nftContractAuctions[_nftContractAddress][_tokenId].ERC20Token;
+        if (_isERC20Auction(auctionERC20Token)) {
+            IERC20(auctionERC20Token).transfer(_recipient, _amount);
+        } else {
+            // Fonları alıcıya gönder
+            (bool success, ) = payable(_recipient).call{value: _amount,gas: 20000}("");
+            // başarısız olursa, daha sonra çekebilmeleri için kredi bakiyelerini güncelleyin
+            if (!success) {
+                failedTransferCredits[_recipient] = failedTransferCredits[_recipient] +_amount;
+            }
+        }
+    }
+    /**********************************/
+    /*╔══════════════════════════════╗
+      ║           BİTİŞ              ║
+      ║  TRANSFER NFT & ÖDEME        ║
+      ╚══════════════════════════════╝*/
+    /**********************************/
 
-        
+    function settleAuction(address _nftContractAddress, uint256 _tokenId) external isAuctionOver(_nftContractAddress, _tokenId){
+        _transferNftAndPaySeller(_nftContractAddress, _tokenId);
+        emit AuctionSettled(_nftContractAddress, _tokenId, msg.sender);
+    }
+
+     function withdrawAuction(address _nftContractAddress, uint256 _tokenId) external {
+        //yalnızca NFT sahibi erken kapatabilir ve açık artırma yapabilir
+        require(IERC721(_nftContractAddress).ownerOf(_tokenId) == msg.sender,"Not NFT owner");
+        _resetAuction(_nftContractAddress, _tokenId);
+        emit AuctionWithdrawn(_nftContractAddress, _tokenId, msg.sender);
+    }
+
+    function withdrawBid(address _nftContractAddress, uint256 _tokenId) external minimumBidNotMade(_nftContractAddress, _tokenId) {
+        address nftHighestBidder = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBidder;
+        require(msg.sender == nftHighestBidder, "Cannot withdraw funds");
+        uint128 nftHighestBid = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid;
+        _resetBids(_nftContractAddress, _tokenId);
+        _payout(_nftContractAddress, _tokenId, nftHighestBidder, nftHighestBid);
+        emit BidWithdrawn(_nftContractAddress, _tokenId, msg.sender);
+    }
+
+    /*╔══════════════════════════════╗
+      ║   AUCTION GÜNCELLEME         ║
+      ╚══════════════════════════════╝*/
+
+    function updateWhitelistedBuyer(address _nftContractAddress , uint256 _tokenId , address _newWhitelistedBuyer) external onlyNftSeller(_nftContractAddress, _tokenId) {
+        require(_isASale(_nftContractAddress, _tokenId), "Not a sale");
+        nftContractAuctions[_nftContractAddress][_tokenId].whitelistedBuyer = _newWhitelistedBuyer;
+        //Bir düşük teklif beyaz listede olmayan bir alıcı tarafından verilmişse, o teklifi tersine çevirin
+        address nftHighestBidder = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBidder;
+        uint128 nftHighestBid = nftContractAuctions[_nftContractAddress][_tokenId].nftHighestBid;
+        if (nftHighestBid > 0 && !(nftHighestBidder == _newWhitelistedBuyer)) {
+            //düşük teklifi yalnızca satıcı farklı bir teklif verirse geri alırız
+            //beyaz listedeki alıcıdan en yüksek teklifi verene
+            _resetBids(_nftContractAddress, _tokenId);
+            _payout(_nftContractAddress,_tokenId,nftHighestBidder,nftHighestBid);
+        }
+        emit WhitelistedBuyerUpdated(_nftContractAddress,_tokenId,_newWhitelistedBuyer);
+    }
+
+        function updateMinimumPrice(address _nftContractAddress,uint256 _tokenId,uint128 _newMinPrice)external
+        onlyNftSeller(_nftContractAddress, _tokenId)
+        minimumBidNotMade(_nftContractAddress, _tokenId)
+        isNotASale(_nftContractAddress, _tokenId)
+        priceGreaterThanZero(_newMinPrice)
+        minPriceDoesNotExceedLimit(nftContractAuctions[_nftContractAddress][_tokenId].buyNowPrice,_newMinPrice)
+    {
+        nftContractAuctions[_nftContractAddress][_tokenId].minPrice = _newMinPrice;
+
+        emit MinimumPriceUpdated(_nftContractAddress, _tokenId, _newMinPrice);
+
+        if (_isMinimumBidMade(_nftContractAddress, _tokenId)) {
+            _transferNftToAuctionContract(_nftContractAddress, _tokenId);
+            _updateAuctionEnd(_nftContractAddress, _tokenId);
+        }
+    }
+
+    function updateBuyNowPrice(address _nftContractAddress , uint256 _tokenId, uint128 _newBuyNowPrice) external 
+    onlyNftSeller(_nftContractAddress , _tokenId)
+    priceGreaterThanZero(_newBuyNowPrice)
+    minPriceDosNotExceedLimit(_newBuyNowPrice, nftContractAuctions[_nftContractAddress[_tokenId]].minPrice) {
+        nftContractAuctions[_nftContractAddress][_tokenId].buyNowPrice = _newBuyNowPrice;
+        emit BuyNowPriceUpdated(nftContractAddress, tokenId, newBuyNowPrice);
+        if (_isBuyNowPriceMet(_nftContractAddress , _tokenId)) {
+            _transferNftToAuctionContract(_nftContractAddress , _tokenId);
+            _transferNftAndPaySeller(_nftContractAddress , _tokenId);
+        }
+    }
+     function takeHighestBid(address _nftContractAddress, uint256 _tokenId)external onlyNftSeller(_nftContractAddress, _tokenId){
+        require(_isABidMade(_nftContractAddress, _tokenId), "cannot payout 0 bid");
+        _transferNftToAuctionContract(_nftContractAddress, _tokenId);
+        _transferNftAndPaySeller(_nftContractAddress, _tokenId);
+        emit HighestBidTaken(_nftContractAddress, _tokenId);
+    }
+
+    /*
+     * Açık artırma için yatırılan bir NFT'nin sahibini sorgulayın
+     */
+    function ownerOfNFT(address _nftContractAddress, uint256 _tokenId) external view returns (address){
+        address nftSeller = nftContractAuctions[_nftContractAddress][_tokenId].nftSeller;
+        require(nftSeller != address(0), "NFT not deposited");
+        return nftSeller;
+    }
+
+    /*
+     * Bir teklifin aktarımı başarısız olursa, alıcının tutarını daha sonra geri almasına izin verin.
+     */
+    function withdrawAllFailedCredits() external {
+        uint256 amount = failedTransferCredits[msg.sender];
+        require(amount != 0, "no credits to withdraw");
+        failedTransferCredits[msg.sender] = 0;
+        (bool successfulWithdraw, ) = msg.sender.call{value: amount, gas: 20000}("");
+        require(successfulWithdraw, "withdraw failed");
+    }
+
 }
